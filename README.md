@@ -1,9 +1,9 @@
-# RLPlane
+# RLPlaine
 
 ## Install 
 
 In the main folder rlplane :
-```git clone git@git.unistra.fr:a.gautheron/rlplane.git && cd rlplane && python3 -m venv venv && source ./venv/bin/activate && pip install -r requirements.txt```
+```git clone git@github.com:starplaye/RLPlaine.git && cd rlplane && python3 -m venv venv && source ./venv/bin/activate && pip install -r requirements.txt```
 
 ## Launch
 
