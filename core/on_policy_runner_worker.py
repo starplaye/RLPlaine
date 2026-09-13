@@ -11,44 +11,35 @@ import torch
 from collections import deque
 
 import rsl_rl
-from core.ppo import PPO, PPOManager
+from core.ppo import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, EmpiricalNormalization
 from rsl_rl.utils import store_code_state
 
-from core.on_policy_runner_worker import OnPolicyRunnerWorker
 
-
-class OnPolicyRunnerHRL:
+class OnPolicyRunnerWorker:
     """On-policy runner for training and evaluation."""
 
-    def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
+    def __init__(self, env: VecEnv, train_cfg: dict, is_freeze: bool, log_dir: str | None = None, device="cpu"):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
         self.mean_episode = 9999
-        self.trained_worker = False
-        self.freeze_worker = train_cfg["worker"]["freeze"]
-        self.decision_step = train_cfg["decision_step"]
-        self.gamma = self.alg_cfg["gamma"]
-        
-        # optimisation
-        self.batch_idx = torch.arange(self.env.num_envs, device=self.device) # remplace les ":" car le GPU les gères moins bien que des tenseurs
+        self.freeze = is_freeze
 
         # resolve dimensions of observations
-        num_actions = train_cfg["num_actions"]
-        obs, extras = self.env.get_observations_manager()
-        num_obs = train_cfg["num_obs"]
+        obs, extras = self.env.get_observations()
+        num_obs = obs.shape[1]
         if "critic" in extras["observations"]:
-            num_critic_obs = train_cfg["num_obs"]
+            num_critic_obs = extras["observations"]["critic"].shape[1]
         else:
             num_critic_obs = num_obs
-        actor_critic_manager_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
+        actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
 
-        actor_critic_manager: ActorCritic | ActorCriticRecurrent = actor_critic_manager_class(
-            num_obs, num_critic_obs, num_actions, **self.policy_cfg
+        actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
+            num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
 
@@ -71,8 +62,8 @@ class OnPolicyRunnerHRL:
             self.alg_cfg["symmetry_cfg"]["_env"] = env
 
         # init algorithm
-        self.alg_cfg.pop("class_name")
-        self.alg_manager = PPOManager(actor_critic_manager, device=self.device, **self.alg_cfg)
+        alg_class = eval(self.alg_cfg.pop("class_name"))  # PPO
+        self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
 
         # store training configuration
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
@@ -85,19 +76,13 @@ class OnPolicyRunnerHRL:
             self.obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
             self.critic_obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
         # init storage and model
-        self.alg_manager.init_storage(
+        self.alg.init_storage(
             self.env.num_envs,
             self.num_steps_per_env,
             [num_obs],
             [num_critic_obs],
-            [num_actions],
+            [self.env.num_actions],
         )
-        
-        # Worker 
-        self.worker_runner = OnPolicyRunnerWorker(env, self.cfg["worker"]["train_cfg"], log_dir, device=device)
-        if self.cfg["worker"]["file"]:
-            self.worker_runner.load(self.cfg["worker"]["file"])
-            self.trained_worker = True         
 
         # Log
         self.log_dir = log_dir
@@ -107,7 +92,8 @@ class OnPolicyRunnerHRL:
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
-    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
+    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
+            
         # initialize writer
         if self.log_dir is not None and self.writer is None:
             # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
@@ -138,14 +124,22 @@ class OnPolicyRunnerHRL:
             )
 
         # start learning
-        subobservation, extras = self.env.get_observations_manager()
-        critic_obs = extras["observations"].get("critic", subobservation)
-        subobservation, critic_obs = subobservation.to(self.device), critic_obs.to(self.device)
+        obs, extras = self.env.get_observations()
+        critic_obs = extras["observations"].get("critic", obs)
+        obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
-        subreward = torch.zeros((self.env.num_envs,), device=self.device)
-        self.paused_envs = torch.full((self.env.num_envs,), False, device=self.device, dtype=torch.bool)
-        self.subdones = torch.full((self.env.num_envs,), False, device=self.device, dtype=torch.bool)
-        self.timer_env = torch.zeros((self.env.num_envs,), dtype=torch.float, device=self.device)
+        
+        # for inference
+        if self.freeze :
+            policy = self.get_inference_policy()
+            with torch.no_grad():
+                while self.freeze :
+                    actions = policy(obs)
+                    obs, rewards, dones, infos, manager_obs, manager_rewards, trigger, infos_manager = self.env.step(actions.to(self.env.device))
+                    
+                    # get infos to manager
+                    yield manager_obs, manager_rewards, dones, trigger, infos_manager
+                    
         
         # Book keeping
         ep_infos = []
@@ -154,79 +148,41 @@ class OnPolicyRunnerHRL:
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         # create buffers for logging extrinsic and intrinsic rewards
-        if self.alg_manager.rnd:
+        if self.alg.rnd:
             erewbuffer = deque(maxlen=100)
             irewbuffer = deque(maxlen=100)
             cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
             cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-        
-        is_decision = False
+
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
-        worker = self.worker_runner.learn(num_learning_iterations=num_learning_iterations, init_at_random_ep_len=True)
         for it in range(start_iter, tot_iter):
             start = time.time()
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
-                     
-                    for _ in range(self.decision_step):
-                        
-                        if not is_decision :
-                            subobservation, extras = self.env.get_observations_manager()
-                            critic_obs = extras["observations"].get("critic", subobservation)
-                            
-                            # Sample actions from policy
-                            actions = self.alg_manager.act(subobservation, critic_obs)  
-                            # Set new subgoal
-                            self.env.set_subgoal(actions,self.batch_idx) 
-                            # have make a decision
-                            is_decision = True 
-                            
-                        obs_temp, rew_temp, dones_temp, trigger, subinfos = next(worker)
-                        self.subdones |= dones_temp
-                        
-                        active_mask = ~self.paused_envs
-                        
-                        # reward calculation
-                        gamma_step = torch.pow(self.gamma, self.timer_env[active_mask]) 
-                        current_rew = rew_temp[active_mask]
-
-                        subreward[active_mask] += gamma_step * current_rew
-                        
-                        # timer
-                        self.timer_env[active_mask] += 1  
-                        
-                        # set new paused envs
-                        new_decisions_mask = trigger & active_mask
-                        
-                        if new_decisions_mask.any():
-                            indices = new_decisions_mask.nonzero(as_tuple=False).flatten()
-                            
-                            subobservation[indices] = obs_temp[indices]
-                            
-                            self.paused_envs |= new_decisions_mask
-
-                    is_decision = False
-                    # Traitement de la reward normalisation
-                    infos = subinfos
+                    # Sample actions from policy
+                    actions = self.alg.act(obs, critic_obs)
                     
+                    # Step environment
+                    obs, rewards, dones, infos, manager_obs, manager_rewards, trigger = self.env.step(actions.to(self.env.device))
+
                     # Move to the agent device
-                    obs, rewards, dones, durations = subobservation.to(self.device), subreward.to(self.device), self.subdones.to(self.device), self.timer_env.to(self.device)
-                    
+                    obs, rewards, dones = obs.to(self.device), rewards.to(self.device), dones.to(self.device)
+
                     # Normalize observations
                     obs = self.obs_normalizer(obs)
                     # Extract critic observations and normalize
                     if "critic" in infos["observations"]:
-                        critic_obs = obs
+                        critic_obs = self.critic_obs_normalizer(infos["observations"]["critic"].to(self.device))
                     else:
                         critic_obs = obs
 
                     # Process env step and store in buffer
-                    self.alg_manager.process_env_step(rewards, dones, infos, durations)
+                    self.alg.process_env_step(rewards, dones, infos)
 
                     # Intrinsic rewards (extracted here only for logging)!
-                    intrinsic_rewards = self.alg_manager.intrinsic_rewards if self.alg_manager.rnd else None
+                    intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
 
                     if self.log_dir is not None:
                         # Book keeping
@@ -235,14 +191,14 @@ class OnPolicyRunnerHRL:
                         elif "log" in infos:
                             ep_infos.append(infos["log"])
                         # Update rewards
-                        if self.alg_manager.rnd:
+                        if self.alg.rnd:
                             cur_ereward_sum += rewards
                             cur_ireward_sum += intrinsic_rewards  # type: ignore
                             cur_reward_sum += rewards + intrinsic_rewards
                         else:
                             cur_reward_sum += rewards
                         # Update episode length
-                        cur_episode_length += 10
+                        cur_episode_length += 1
                         # Clear data for completed episodes
                         # -- common
                         new_ids = (dones > 0).nonzero(as_tuple=False)
@@ -251,59 +207,52 @@ class OnPolicyRunnerHRL:
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
                         # -- intrinsic and extrinsic rewards
-                        if self.alg_manager.rnd:
+                        if self.alg.rnd:
                             erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
                             irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
                             cur_ereward_sum[new_ids] = 0
                             cur_ireward_sum[new_ids] = 0
                     
-                    # reset param     
-                    self.timer_env[self.batch_idx] = 0.
-                    subreward[self.batch_idx] = 0.
-                    self.paused_envs[self.batch_idx] = False
-                    self.subdones[self.batch_idx] = False
+                    # get infos to manager
+                    yield manager_obs, manager_rewards, dones, trigger, infos
 
                 stop = time.time()
                 collection_time = stop - start
 
                 # Learning step
                 start = stop
-                self.alg_manager.compute_returns(critic_obs)
+                self.alg.compute_returns(critic_obs)
 
             # Update policy
             # Note: we keep arguments here since locals() loads them
-            mean_value_loss, mean_surrogate_loss, mean_entropy, mean_rnd_loss, mean_symmetry_loss = self.alg_manager.update()
+            mean_value_loss, mean_surrogate_loss, mean_entropy, mean_rnd_loss, mean_symmetry_loss = self.alg.update()
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
 
-            # Logging info and save checkpoint
-            if self.log_dir is not None:
-                # Log information
-                self.log(locals())
-                # Save model
-                if it % self.save_interval == 0:
-                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+        #     # Logging info and save checkpoint
+        #     if self.log_dir is not None:
+        #         # Log information
+        #         self.log(locals())
+        #         # Save model
+        #         if it % self.save_interval == 0:
+        #             self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
 
-            # Other stats
-            w,f,r = self.env.stats_game()
-            print(f" HRL // {w*100}% win rate // {f*100}% fail rate (timeout) // {r} regret")
-            
-            # Clear episode infos
-            ep_infos.clear()
+        #     # Clear episode infos
+        #     ep_infos.clear()
 
-            # Save code state
-            if it == start_iter:
-                # obtain all the diff files
-                git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
-                # if possible store them to wandb
-                if self.logger_type in ["wandb", "neptune"] and git_file_paths:
-                    for path in git_file_paths:
-                        self.writer.save_file(path)
+        #     # Save code state
+        #     if it == start_iter:
+        #         # obtain all the diff files
+        #         git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
+        #         # if possible store them to wandb
+        #         if self.logger_type in ["wandb", "neptune"] and git_file_paths:
+        #             for path in git_file_paths:
+        #                 self.writer.save_file(path)
 
-        # Save the final model after training
-        if self.log_dir is not None:
-            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+        # # Save the final model after training
+        # if self.log_dir is not None:
+        #     self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
@@ -332,12 +281,8 @@ class OnPolicyRunnerHRL:
                 else:
                     self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
-        mean_std = self.alg_manager.actor_critic.action_std.mean()
+        mean_std = self.alg.actor_critic.action_std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
-
-        w,f,r = self.env.stats_game()
-        self.writer.add_scalar("Episode/win_rate", w, locs["it"])
-        self.writer.add_scalar("Episode/regret_rate", r, locs["it"])
 
         # -- means var --
         # self.mean_len = statistics.mean(locs['lenbuffer'])
@@ -346,10 +291,10 @@ class OnPolicyRunnerHRL:
         self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])
         self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
         self.writer.add_scalar("Loss/entropy", locs["mean_entropy"], locs["it"])
-        self.writer.add_scalar("Loss/learning_rate", self.alg_manager.learning_rate, locs["it"])
-        if self.alg_manager.rnd:
+        self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
+        if self.alg.rnd:
             self.writer.add_scalar("Loss/rnd", locs["mean_rnd_loss"], locs["it"])
-        if self.alg_manager.symmetry:
+        if self.alg.symmetry:
             self.writer.add_scalar("Loss/symmetry", locs["mean_symmetry_loss"], locs["it"])
 
         # -- Policy
@@ -363,10 +308,10 @@ class OnPolicyRunnerHRL:
         # -- Training
         if len(locs["rewbuffer"]) > 0:
             # separate logging for intrinsic and extrinsic rewards
-            if self.alg_manager.rnd:
+            if self.alg.rnd:
                 self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(locs["erewbuffer"]), locs["it"])
                 self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(locs["irewbuffer"]), locs["it"])
-                self.writer.add_scalar("Rnd/weight", self.alg_manager.rnd.weight, locs["it"])
+                self.writer.add_scalar("Rnd/weight", self.alg.rnd.weight, locs["it"])
             # everything else
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
@@ -389,13 +334,13 @@ class OnPolicyRunnerHRL:
             )
 
             # -- For symmetry
-            if self.alg_manager.symmetry:
+            if self.alg.symmetry:
                 log_string += f"""{'Symmetry loss:':>{pad}} {locs['mean_symmetry_loss']:.4f}\n"""
 
             log_string += f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
 
             # -- For RND
-            if self.alg_manager.rnd:
+            if self.alg.rnd:
                 log_string += (
                     f"""{'Mean extrinsic reward:':>{pad}} {statistics.mean(locs['erewbuffer']):.2f}\n"""
                     f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n"""
@@ -416,7 +361,7 @@ class OnPolicyRunnerHRL:
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
             )
             # -- For symmetry
-            if self.alg_manager.symmetry:
+            if self.alg.symmetry:
                 log_string += f"""{'Symmetry loss:':>{pad}} {locs['mean_symmetry_loss']:.4f}\n"""
 
             log_string += f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
@@ -438,15 +383,15 @@ class OnPolicyRunnerHRL:
     def save(self, path: str, infos=None):
         # -- Save PPO model
         saved_dict = {
-            "model_state_dict": self.alg_manager.actor_critic.state_dict(),
-            "optimizer_state_dict": self.alg_manager.optimizer.state_dict(),
+            "model_state_dict": self.alg.actor_critic.state_dict(),
+            "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
         # -- Save RND model if used
-        if self.alg_manager.rnd:
-            saved_dict["rnd_state_dict"] = self.alg_manager.rnd.state_dict()
-            saved_dict["rnd_optimizer_state_dict"] = self.alg_manager.rnd_optimizer.state_dict()
+        if self.alg.rnd:
+            saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
+            saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
         # -- Save observation normalizer if used
         if self.empirical_normalization:
             saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
@@ -460,10 +405,10 @@ class OnPolicyRunnerHRL:
     def load(self, path: str, load_optimizer: bool = True):
         loaded_dict = torch.load(path, weights_only=False)
         # -- Load PPO model
-        self.alg_manager.actor_critic.load_state_dict(loaded_dict["model_state_dict"])
+        self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"])
         # -- Load RND model if used
-        if self.alg_manager.rnd:
-            self.alg_manager.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+        if self.alg.rnd:
+            self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
         # -- Load observation normalizer if used
         if self.empirical_normalization:
             self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
@@ -471,10 +416,10 @@ class OnPolicyRunnerHRL:
         # -- Load optimizer if used
         if load_optimizer:
             # -- PPO
-            self.alg_manager.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
             # -- RND optimizer if used
-            if self.alg_manager.rnd:
-                self.alg_manager.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+            if self.alg.rnd:
+                self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
         # -- Load current learning iteration
         self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
@@ -482,20 +427,20 @@ class OnPolicyRunnerHRL:
     def get_inference_policy(self, device=None):
         self.eval_mode()  # switch to evaluation mode (dropout for example)
         if device is not None:
-            self.alg_manager.actor_critic.to(device)
-        policy = self.alg_manager.actor_critic.act_inference
+            self.alg.actor_critic.to(device)
+        policy = self.alg.actor_critic.act_inference
         if self.cfg["empirical_normalization"]:
             if device is not None:
                 self.obs_normalizer.to(device)
-            policy = lambda x: self.alg_manager.actor_critic.act_inference(self.obs_normalizer(x))  # noqa: E731
+            policy = lambda x: self.alg.actor_critic.act_inference(self.obs_normalizer(x))  # noqa: E731
         return policy
 
     def train_mode(self):
         # -- PPO
-        self.alg_manager.actor_critic.train()
+        self.alg.actor_critic.train()
         # -- RND
-        if self.alg_manager.rnd:
-            self.alg_manager.rnd.train()
+        if self.alg.rnd:
+            self.alg.rnd.train()
         # -- Normalization
         if self.empirical_normalization:
             self.obs_normalizer.train()
@@ -503,10 +448,10 @@ class OnPolicyRunnerHRL:
 
     def eval_mode(self):
         # -- PPO
-        self.alg_manager.actor_critic.eval()
+        self.alg.actor_critic.eval()
         # -- RND
-        if self.alg_manager.rnd:
-            self.alg_manager.rnd.eval()
+        if self.alg.rnd:
+            self.alg.rnd.eval()
         # -- Normalization
         if self.empirical_normalization:
             self.obs_normalizer.eval()

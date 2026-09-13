@@ -11,7 +11,7 @@ import torch
 from collections import deque
 
 import rsl_rl
-from core.ppo import PPO, PPOManager
+from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, EmpiricalNormalization
 from rsl_rl.utils import store_code_state
@@ -32,10 +32,6 @@ class OnPolicyRunnerHRL:
         self.trained_worker = False
         self.freeze_worker = train_cfg["worker"]["freeze"]
         self.decision_step = train_cfg["decision_step"]
-        self.gamma = self.alg_cfg["gamma"]
-        
-        # optimisation
-        self.batch_idx = torch.arange(self.env.num_envs, device=self.device) # remplace les ":" car le GPU les gères moins bien que des tenseurs
 
         # resolve dimensions of observations
         num_actions = train_cfg["num_actions"]
@@ -71,8 +67,8 @@ class OnPolicyRunnerHRL:
             self.alg_cfg["symmetry_cfg"]["_env"] = env
 
         # init algorithm
-        self.alg_cfg.pop("class_name")
-        self.alg_manager = PPOManager(actor_critic_manager, device=self.device, **self.alg_cfg)
+        alg_class_manager = eval(self.alg_cfg.pop("class_name"))  # PPO
+        self.alg_manager: PPO = alg_class_manager(actor_critic_manager, device=self.device, **self.alg_cfg)
 
         # store training configuration
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
@@ -139,13 +135,11 @@ class OnPolicyRunnerHRL:
 
         # start learning
         subobservation, extras = self.env.get_observations_manager()
-        critic_obs = extras["observations"].get("critic", subobservation)
-        subobservation, critic_obs = subobservation.to(self.device), critic_obs.to(self.device)
+        subcritic_obs = extras["observations"].get("critic", subobservation)
+        subobservation, subcritic_obs = subobservation.to(self.device), subcritic_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
-        subreward = torch.zeros((self.env.num_envs,), device=self.device)
-        self.paused_envs = torch.full((self.env.num_envs,), False, device=self.device, dtype=torch.bool)
-        self.subdones = torch.full((self.env.num_envs,), False, device=self.device, dtype=torch.bool)
-        self.timer_env = torch.zeros((self.env.num_envs,), dtype=torch.float, device=self.device)
+        self.current_env = torch.arange(self.env.num_envs, device=self.device)
+        self.timer_env = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         
         # Book keeping
         ep_infos = []
@@ -159,8 +153,7 @@ class OnPolicyRunnerHRL:
             irewbuffer = deque(maxlen=100)
             cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
             cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-        
-        is_decision = False
+
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
         worker = self.worker_runner.learn(num_learning_iterations=num_learning_iterations, init_at_random_ep_len=True)
@@ -168,100 +161,71 @@ class OnPolicyRunnerHRL:
             start = time.time()
             # Rollout
             with torch.inference_mode():
-                for _ in range(self.num_steps_per_env):
-                     
-                    for _ in range(self.decision_step):
+                for _ in range(self.decision_step):
+                    for _ in range(self.num_steps_per_env):
                         
-                        if not is_decision :
-                            subobservation, extras = self.env.get_observations_manager()
-                            critic_obs = extras["observations"].get("critic", subobservation)
-                            
+                        if len(self.current_env) != 0 :
                             # Sample actions from policy
-                            actions = self.alg_manager.act(subobservation, critic_obs)  
+                            actions = self.alg_manager.act(subobservation[self.current_env], subcritic_obs[self.current_env])  
                             # Set new subgoal
-                            self.env.set_subgoal(actions,self.batch_idx) 
-                            # have make a decision
-                            is_decision = True 
+                            self.env.set_subgoal(actions,self.current_env)   
+                                
+                        subreward, subobservation, subdones, trigger, subinfos = next(worker)
+                        
+                        self.timer_env += 1
+                        decision_condition = trigger | (self.timer_env >= self.decision_step)
+                        
+                        self.current_env = decision_condition.nonzero(as_tuple=False).flatten()             
+
+                        if len(self.current_env) != 0 :
+                            obs_buf, rewards_buf, dones_buf, infos = subobservation[self.current_env], subreward[self.current_env], subdones[self.current_env], subinfos
+                            self.timer_env[self.current_env] = 0
                             
-                        obs_temp, rew_temp, dones_temp, trigger, subinfos = next(worker)
-                        self.subdones |= dones_temp
-                        
-                        active_mask = ~self.paused_envs
-                        
-                        # reward calculation
-                        gamma_step = torch.pow(self.gamma, self.timer_env[active_mask]) 
-                        current_rew = rew_temp[active_mask]
+                            # Move to the agent device
+                            obs, rewards, dones = obs.to(self.device), rewards.to(self.device), dones.to(self.device)
 
-                        subreward[active_mask] += gamma_step * current_rew
-                        
-                        # timer
-                        self.timer_env[active_mask] += 1  
-                        
-                        # set new paused envs
-                        new_decisions_mask = trigger & active_mask
-                        
-                        if new_decisions_mask.any():
-                            indices = new_decisions_mask.nonzero(as_tuple=False).flatten()
-                            
-                            subobservation[indices] = obs_temp[indices]
-                            
-                            self.paused_envs |= new_decisions_mask
+                            # Normalize observations
+                            obs = self.obs_normalizer(obs)
+                            # Extract critic observations and normalize
+                            if "critic" in infos["observations"]:
+                                critic_obs = self.critic_obs_normalizer(infos["observations"]["critic"].to(self.device))
+                            else:
+                                critic_obs = obs
 
-                    is_decision = False
-                    # Traitement de la reward normalisation
-                    infos = subinfos
-                    
-                    # Move to the agent device
-                    obs, rewards, dones, durations = subobservation.to(self.device), subreward.to(self.device), self.subdones.to(self.device), self.timer_env.to(self.device)
-                    
-                    # Normalize observations
-                    obs = self.obs_normalizer(obs)
-                    # Extract critic observations and normalize
-                    if "critic" in infos["observations"]:
-                        critic_obs = obs
-                    else:
-                        critic_obs = obs
+                            # Process env step and store in buffer
+                            self.alg_manager.process_env_step(rewards, dones, infos)
 
-                    # Process env step and store in buffer
-                    self.alg_manager.process_env_step(rewards, dones, infos, durations)
+                            # Intrinsic rewards (extracted here only for logging)!
+                            intrinsic_rewards = self.alg_manager.intrinsic_rewards if self.alg_manager.rnd else None
 
-                    # Intrinsic rewards (extracted here only for logging)!
-                    intrinsic_rewards = self.alg_manager.intrinsic_rewards if self.alg_manager.rnd else None
-
-                    if self.log_dir is not None:
-                        # Book keeping
-                        if "episode" in infos:
-                            ep_infos.append(infos["episode"])
-                        elif "log" in infos:
-                            ep_infos.append(infos["log"])
-                        # Update rewards
-                        if self.alg_manager.rnd:
-                            cur_ereward_sum += rewards
-                            cur_ireward_sum += intrinsic_rewards  # type: ignore
-                            cur_reward_sum += rewards + intrinsic_rewards
-                        else:
-                            cur_reward_sum += rewards
-                        # Update episode length
-                        cur_episode_length += 10
-                        # Clear data for completed episodes
-                        # -- common
-                        new_ids = (dones > 0).nonzero(as_tuple=False)
-                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
-                        cur_reward_sum[new_ids] = 0
-                        cur_episode_length[new_ids] = 0
-                        # -- intrinsic and extrinsic rewards
-                        if self.alg_manager.rnd:
-                            erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                            irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                            cur_ereward_sum[new_ids] = 0
-                            cur_ireward_sum[new_ids] = 0
-                    
-                    # reset param     
-                    self.timer_env[self.batch_idx] = 0.
-                    subreward[self.batch_idx] = 0.
-                    self.paused_envs[self.batch_idx] = False
-                    self.subdones[self.batch_idx] = False
+                            if self.log_dir is not None:
+                                # Book keeping
+                                if "episode" in infos:
+                                    ep_infos.append(infos["episode"])
+                                elif "log" in infos:
+                                    ep_infos.append(infos["log"])
+                                # Update rewards
+                                if self.alg_manager.rnd:
+                                    cur_ereward_sum += rewards
+                                    cur_ireward_sum += intrinsic_rewards  # type: ignore
+                                    cur_reward_sum += rewards + intrinsic_rewards
+                                else:
+                                    cur_reward_sum += rewards
+                                # Update episode length
+                                cur_episode_length += 1
+                                # Clear data for completed episodes
+                                # -- common
+                                new_ids = (dones > 0).nonzero(as_tuple=False)
+                                rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                                lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                                cur_reward_sum[new_ids] = 0
+                                cur_episode_length[new_ids] = 0
+                                # -- intrinsic and extrinsic rewards
+                                if self.alg_manager.rnd:
+                                    erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                                    irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                                    cur_ereward_sum[new_ids] = 0
+                                    cur_ireward_sum[new_ids] = 0
 
                 stop = time.time()
                 collection_time = stop - start
@@ -285,10 +249,6 @@ class OnPolicyRunnerHRL:
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
 
-            # Other stats
-            w,f,r = self.env.stats_game()
-            print(f" HRL // {w*100}% win rate // {f*100}% fail rate (timeout) // {r} regret")
-            
             # Clear episode infos
             ep_infos.clear()
 
@@ -334,10 +294,6 @@ class OnPolicyRunnerHRL:
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
         mean_std = self.alg_manager.actor_critic.action_std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
-
-        w,f,r = self.env.stats_game()
-        self.writer.add_scalar("Episode/win_rate", w, locs["it"])
-        self.writer.add_scalar("Episode/regret_rate", r, locs["it"])
 
         # -- means var --
         # self.mean_len = statistics.mean(locs['lenbuffer'])
